@@ -20,6 +20,7 @@ from browser_use.agent.cloud_events import (
 	CreateAgentTaskEvent,
 	UpdateAgentTaskEvent,
 )
+from browser_use.agent.action_event import ActionCallback, ActionEvent
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
@@ -148,6 +149,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		) = None,
 		register_external_agent_status_raise_error_callback: Callable[[], Awaitable[bool]] | None = None,
 		register_should_stop_callback: Callable[[], Awaitable[bool]] | None = None,
+		# Called twice around every single action ("before" and "after"). See agent/action_event.py.
+		register_action_callback: ActionCallback | None = None,
 		# Agent settings
 		output_model_schema: type[AgentStructuredOutput] | None = None,
 		use_vision: bool | Literal['auto'] = 'auto',
@@ -426,6 +429,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.register_new_step_callback = register_new_step_callback
 		self.register_done_callback = register_done_callback
 		self.register_should_stop_callback = register_should_stop_callback
+		self.register_action_callback = register_action_callback
 		self.register_external_agent_status_raise_error_callback = register_external_agent_status_raise_error_callback
 
 		# Telemetry
@@ -1889,6 +1893,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			cached_element_hashes = set()
 
 		for i, action in enumerate(actions):
+			action_event: ActionEvent | None = None
 			if i > 0:
 				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
 				if action.model_dump(exclude_unset=True).get('done') is not None:
@@ -1910,6 +1915,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Log action before execution
 				self._log_action(action, action_name, i + 1, total_actions)
 
+				# Tell the optional action callback what we are about to do (no-op if none is set).
+				action_event = await self._notify_action_before(action_name, action_data, i, total_actions)
+
 				time_start = time.time()
 
 				result = await self.tools.act(
@@ -1924,6 +1932,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				time_end = time.time()
 				time_elapsed = time_end - time_start
 
+				# Tell the callback how it went.
+				await self._notify_action_after(action_event, result.error)
+
 				results.append(result)
 
 				if results[-1].is_done or results[-1].error or i == total_actions - 1:
@@ -1932,9 +1943,90 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except Exception as e:
 				# Handle any exceptions during action execution
 				self.logger.error(f'❌ Executing action {i + 1} failed -> {type(e).__name__}: {e}')
+				# The callback should also hear about actions that blew up.
+				await self._notify_action_after(action_event, f'{type(e).__name__}: {e}')
 				raise e
 
 		return results
+
+	async def _notify_action_before(
+		self, action_name: str, action_data: dict[str, Any], position: int, actions_in_step: int
+	) -> ActionEvent | None:
+		"""Call the action callback just BEFORE an action runs.
+
+		Why: this is the only moment the element number (like [12]) still points at a
+		real element on the page, so outside code can describe that element now.
+
+		Returns the event so the matching "after" call can fill in the result, or
+		None when no callback is set (then nothing here costs anything).
+		A broken callback is logged and ignored: it must never break the agent.
+		"""
+		if self.register_action_callback is None:
+			return None
+
+		try:
+			params = action_data.get(action_name) or {}
+			params = dict(params) if isinstance(params, dict) else {}
+
+			# Find the real element the action points at, if it points at one.
+			element = None
+			index = params.get('index')
+			if isinstance(index, int):
+				element = await self.browser_session.get_dom_element_by_index(index)
+
+			model_output = self.state.last_model_output  # None when used outside the agent loop
+			try:
+				url_before = await self.browser_session.get_current_page_url()
+			except Exception:
+				url_before = None
+
+			event = ActionEvent(
+				phase='before',
+				step=self.state.n_steps,
+				position=position,
+				actions_in_step=actions_in_step,
+				action_name=action_name,
+				params=params,
+				element=element,
+				next_goal=model_output.next_goal if model_output else None,
+				evaluation=model_output.evaluation_previous_goal if model_output else None,
+				url_before=url_before,
+			)
+			await self._call_action_callback(event)
+			return event
+		except Exception as e:
+			self.logger.warning(f'register_action_callback (before) failed, ignoring: {type(e).__name__}: {e}')
+			return None
+
+	async def _notify_action_after(self, event: ActionEvent | None, error: str | None) -> None:
+		"""Call the action callback just AFTER an action finished (or failed).
+
+		`error` is None when the action worked. Does nothing if `event` is None
+		(no callback was set, or the "before" call failed).
+		"""
+		if event is None:
+			return
+
+		try:
+			try:
+				event.url_after = await self.browser_session.get_current_page_url()
+			except Exception:
+				event.url_after = None
+			event.phase = 'after'
+			event.success = error is None
+			event.error = error
+			await self._call_action_callback(event)
+		except Exception as e:
+			self.logger.warning(f'register_action_callback (after) failed, ignoring: {type(e).__name__}: {e}')
+
+	async def _call_action_callback(self, event: ActionEvent) -> None:
+		"""Run the callback, whether it is a plain function or an `async def`."""
+		callback = self.register_action_callback
+		if callback is None:
+			return
+		outcome = callback(event)
+		if inspect.isawaitable(outcome):
+			await outcome
 
 	def _log_action(self, action, action_name: str, action_num: int, total_actions: int) -> None:
 		"""Log the action before execution with colored formatting"""
